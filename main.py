@@ -1038,6 +1038,13 @@ async def check_seller_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ====================================================
 
 def main() -> None:
+    # سازگاری با Python 3.12+ — اطمینان از وجود event loop پیش از شروع PTB
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     db.init_db()
     logger.info("دیتابیس راه‌اندازی شد.")
 
