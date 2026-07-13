@@ -1037,7 +1037,7 @@ async def check_seller_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
 # راه‌اندازی اصلی
 # ====================================================
 
-async def main() -> None:
+def main() -> None:
     db.init_db()
     logger.info("دیتابیس راه‌اندازی شد.")
 
@@ -1054,17 +1054,17 @@ async def main() -> None:
     app.add_handler(admin_conversation())
 
     # هندلرهای منو
-    app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"),          admin_panel_handler))
-    app.add_handler(MessageHandler(filters.Regex("^🚫 لیست کاربران مسدود$"),  list_banned_handler))
-    app.add_handler(MessageHandler(filters.Regex("^🔙 بازگشت به منوی اصلی$"), back_to_main))
-    app.add_handler(MessageHandler(filters.Regex("^📋 آگهی‌های من$"),          my_listings_handler))
+    app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"),         admin_panel_handler))
+    app.add_handler(MessageHandler(filters.Regex("^🚫 لیست کاربران مسدود$"), list_banned_handler))
+    app.add_handler(MessageHandler(filters.Regex("^🔙 بازگشت به منوی اصلی$"),back_to_main))
+    app.add_handler(MessageHandler(filters.Regex("^📋 آگهی‌های من$"),         my_listings_handler))
 
     # Callback های تأیید/رد
-    app.add_handler(CallbackQueryHandler(admin_approve_callback,    pattern=r"^admin_approve_\d+$"))
-    app.add_handler(CallbackQueryHandler(admin_reject_callback,     pattern=r"^admin_reject_\d+$"))
-    app.add_handler(CallbackQueryHandler(seller_confirm_callback,   pattern=r"^seller_confirm_\d+$"))
-    app.add_handler(CallbackQueryHandler(view_listing_callback,     pattern=r"^view_listing_\d+$"))
-    app.add_handler(CallbackQueryHandler(delete_listing_callback,   pattern=r"^delete_listing_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_approve_callback,  pattern=r"^admin_approve_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_reject_callback,   pattern=r"^admin_reject_\d+$"))
+    app.add_handler(CallbackQueryHandler(seller_confirm_callback, pattern=r"^seller_confirm_\d+$"))
+    app.add_handler(CallbackQueryHandler(view_listing_callback,   pattern=r"^view_listing_\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_listing_callback, pattern=r"^delete_listing_\d+$"))
     app.add_handler(CallbackQueryHandler(my_listings_back_callback, pattern="^my_listings_back$"))
 
     # وظیفه دوره‌ای timeout
@@ -1075,16 +1075,8 @@ async def main() -> None:
     )
 
     logger.info("ربات شروع به کار کرد (Polling)...")
-
-    # ✅ سازگار با Python 3.12 تا 3.14
-    async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        await asyncio.Event().wait()   # تا SIGTERM/SIGINT از Render منتظر بماند
-        await app.updater.stop()
-        await app.stop()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())   # ← event loop قبل از همه چیز ساخته می‌شه
+    main()
