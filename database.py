@@ -13,7 +13,7 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """ایجاد جداول در صورت نبودن."""
+    """ایجاد جداول در صورت نبودن و اعمال مهاجرت‌های لازم."""
     with get_connection() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -32,6 +32,7 @@ def init_db() -> None:
                 seller_id       INTEGER NOT NULL,
                 title           TEXT NOT NULL,
                 description     TEXT NOT NULL,
+                price           TEXT NOT NULL DEFAULT '',
                 email           TEXT NOT NULL,
                 password        TEXT NOT NULL,
                 new_email       TEXT,
@@ -63,6 +64,13 @@ def init_db() -> None:
                 FOREIGN KEY (buyer_id) REFERENCES users(user_id)
             );
         """)
+
+    # مهاجرت: اضافه‌کردن ستون price به جدول موجود (اگر وجود نداشت)
+    with get_connection() as conn:
+        try:
+            conn.execute("ALTER TABLE listings ADD COLUMN price TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # ستون از قبل وجود دارد
 
 
 # ===========================
@@ -149,6 +157,7 @@ def create_listing(
     seller_id: int,
     title: str,
     description: str,
+    price: str,
     email: str,
     password: str,
     new_email: str | None,
@@ -160,10 +169,10 @@ def create_listing(
         cur = conn.execute(
             """
             INSERT INTO listings
-                (unique_code, seller_id, title, description, email, password, new_email, phone)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (unique_code, seller_id, title, description, price, email, password, new_email, phone)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (code, seller_id, title, description, email, password, new_email, phone),
+            (code, seller_id, title, description, price, email, password, new_email, phone),
         )
         return cur.lastrowid, code
 
@@ -242,6 +251,19 @@ def get_seller_listings(seller_id: int) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM listings WHERE seller_id = ? ORDER BY created_at DESC",
             (seller_id,),
+        ).fetchall()
+
+
+def get_all_listings(status_filter: str | None = None) -> list[sqlite3.Row]:
+    """دریافت همه آگهی‌ها (برای ادمین). در صورت ارائه فیلتر، فقط آن وضعیت برگردانده می‌شود."""
+    with get_connection() as conn:
+        if status_filter:
+            return conn.execute(
+                "SELECT * FROM listings WHERE status = ? ORDER BY created_at DESC",
+                (status_filter,),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM listings ORDER BY created_at DESC"
         ).fetchall()
 
 

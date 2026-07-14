@@ -18,6 +18,9 @@ ADMIN_IDS: list[int] = [
     int(x.strip()) for x in os.environ["ADMIN_IDS"].split(",") if x.strip()
 ]
 
+# یوزرنیم ربات (بدون @) — برای نمایش در آگهی‌های کانال
+BOT_USERNAME: str = os.environ.get("BOT_USERNAME", "")
+
 # اطلاعات کارت بانکی
 CARD_NUMBER: str = os.environ["CARD_NUMBER"]
 CARD_OWNER: str = os.environ["CARD_OWNER"]
@@ -30,3 +33,6 @@ TIMEOUT_CHECK_INTERVAL_MINUTES: int = int(os.environ.get("TIMEOUT_CHECK_INTERVAL
 
 # مدت زمان تأیید فروشنده (ساعت)
 SELLER_CONFIRM_TIMEOUT_HOURS: int = int(os.environ.get("SELLER_CONFIRM_TIMEOUT_HOURS", "72"))
+
+# پورت health-check برای UptimeRobot / Render (پیش‌فرض: 8080)
+HEALTH_PORT: int = int(os.environ.get("PORT", "8080"))

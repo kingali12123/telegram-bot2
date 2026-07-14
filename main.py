@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """ربات واسطه خرید و فروش اکانت بازی — نقطه ورود اصلی"""
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InputMediaPhoto, Bot
 from telegram.error import TelegramError
@@ -20,14 +22,19 @@ import database as db
 from config import (
     ADMIN_IDS,
     BOT_TOKEN,
+    BOT_USERNAME,
     CARD_NUMBER,
     CARD_OWNER,
     CHANNEL_ID,
     CHANNEL_LINK,
+    HEALTH_PORT,
     SELLER_CONFIRM_TIMEOUT_HOURS,
     TIMEOUT_CHECK_INTERVAL_MINUTES,
 )
 from keyboards import (
+    admin_listing_actions_keyboard,
+    admin_listings_filter_keyboard,
+    admin_listings_keyboard,
     admin_panel_keyboard,
     admin_receipt_keyboard,
     channel_join_keyboard,
@@ -54,6 +61,7 @@ logger = logging.getLogger(__name__)
 (
     SELL_TITLE,
     SELL_DESCRIPTION,
+    SELL_PRICE,
     SELL_PHOTOS,
     SELL_VIDEO,
     SELL_EMAIL,
@@ -61,13 +69,14 @@ logger = logging.getLogger(__name__)
     SELL_EMAIL_CHANGE_Q,
     SELL_NEW_EMAIL,
     SELL_PHONE,
-) = range(9)
+) = range(10)
 
 # مراحل مکالمه خرید
-BUY_ENTER_CODE, BUY_SEND_RECEIPT = range(9, 11)
+BUY_ENTER_CODE, BUY_SEND_RECEIPT = range(10, 12)
 
 # مراحل مکالمه ادمین
-ADMIN_WAIT_UNBAN_ID = 11
+ADMIN_WAIT_UNBAN_ID = 12
+ADMIN_WAIT_SEARCH_CODE = 13
 
 # وضعیت فارسی آگهی
 STATUS_FA = {
@@ -76,6 +85,27 @@ STATUS_FA = {
     "inactive": "🔴 غیرفعال",
     "sold":     "✅ فروخته شده",
 }
+
+
+# ====================================================
+# Health-check HTTP server (برای UptimeRobot / Render)
+# ====================================================
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args) -> None:  # نویز لاگ را سرکوب کن
+        pass
+
+
+def _start_health_server() -> None:
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
+    logger.info("Health-check server started on port %d", HEALTH_PORT)
+    server.serve_forever()
 
 
 # ====================================================
@@ -147,6 +177,13 @@ async def send_main_menu(
         text,
         reply_markup=main_menu_keyboard(is_admin=is_admin(user_id)),
     )
+
+
+def _bot_link() -> str:
+    """لینک ربات برای نمایش در متن آگهی کانال."""
+    if BOT_USERNAME:
+        return f"@{BOT_USERNAME}"
+    return ""
 
 
 # ====================================================
@@ -253,7 +290,7 @@ async def sell_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await update.message.reply_text(
         "📢 <b>ثبت آگهی فروش اکانت</b>\n\n"
-        "مرحله ۱/۸ — لطفاً <b>عنوان آگهی</b> را وارد کنید:\n"
+        "مرحله ۱/۹ — لطفاً <b>عنوان آگهی</b> را وارد کنید:\n"
         "(مثال: اکانت کلش آف کلنز تاون ۱۵)",
         reply_markup=sell_cancel_keyboard(),
         parse_mode="HTML",
@@ -265,7 +302,7 @@ async def sell_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["title"] = update.message.text.strip()
     await update.message.reply_text(
         "✅ عنوان ثبت شد.\n\n"
-        "مرحله ۲/۸ — لطفاً <b>توضیحات آگهی</b> را بنویسید:\n"
+        "مرحله ۲/۹ — لطفاً <b>توضیحات آگهی</b> را بنویسید:\n"
         "(آمار، لول، آیتم‌ها و جزئیات اکانت را ذکر کنید)",
         reply_markup=sell_cancel_keyboard(),
         parse_mode="HTML",
@@ -277,7 +314,19 @@ async def sell_receive_description(update: Update, context: ContextTypes.DEFAULT
     context.user_data["description"] = update.message.text.strip()
     await update.message.reply_text(
         "✅ توضیحات ثبت شد.\n\n"
-        "مرحله ۳/۸ — لطفاً <b>تصاویر اسکرین‌شات</b> اکانت را ارسال کنید.\n"
+        "مرحله ۳/۹ — لطفاً <b>قیمت فروش</b> را وارد کنید:\n"
+        "(مثال: ۵۰۰,۰۰۰ تومان یا ۲۰ دلار)",
+        reply_markup=sell_cancel_keyboard(),
+        parse_mode="HTML",
+    )
+    return SELL_PRICE
+
+
+async def sell_receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["price"] = update.message.text.strip()
+    await update.message.reply_text(
+        "✅ قیمت ثبت شد.\n\n"
+        "مرحله ۴/۹ — لطفاً <b>تصاویر اسکرین‌شات</b> اکانت را ارسال کنید.\n"
         "می‌توانید چند تصویر بفرستید. وقتی تمام شد روی دکمه زیر بزنید:",
         reply_markup=sell_end_photos_keyboard(),
         parse_mode="HTML",
@@ -304,7 +353,7 @@ async def sell_end_photos_callback(update: Update, context: ContextTypes.DEFAULT
         return SELL_PHOTOS
     await query.edit_message_text(
         "✅ تصاویر ثبت شدند.\n\n"
-        "مرحله ۴/۸ — می‌توانید یک <b>ویدیو</b> از گیم‌پلی اکانت ارسال کنید (اختیاری):",
+        "مرحله ۵/۹ — می‌توانید یک <b>ویدیو</b> از گیم‌پلی اکانت ارسال کنید (اختیاری):",
         reply_markup=sell_skip_video_keyboard(),
         parse_mode="HTML",
     )
@@ -315,7 +364,7 @@ async def sell_receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["video"] = update.message.video.file_id
     await update.message.reply_text(
         "✅ ویدیو دریافت شد.\n\n"
-        "مرحله ۵/۸ — لطفاً <b>ایمیل اکانت</b> را وارد کنید:",
+        "مرحله ۶/۹ — لطفاً <b>ایمیل اکانت</b> را وارد کنید:",
         reply_markup=sell_cancel_keyboard(),
         parse_mode="HTML",
     )
@@ -327,7 +376,7 @@ async def sell_skip_video_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     await query.edit_message_text(
         "⏭ ویدیو رد شد.\n\n"
-        "مرحله ۵/۸ — لطفاً <b>ایمیل اکانت</b> را وارد کنید:",
+        "مرحله ۶/۹ — لطفاً <b>ایمیل اکانت</b> را وارد کنید:",
         parse_mode="HTML",
     )
     return SELL_EMAIL
@@ -337,7 +386,7 @@ async def sell_receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["email"] = update.message.text.strip()
     await update.message.reply_text(
         "✅ ایمیل ثبت شد.\n\n"
-        "مرحله ۶/۸ — لطفاً <b>رمز عبور اکانت</b> را وارد کنید:",
+        "مرحله ۷/۹ — لطفاً <b>رمز عبور اکانت</b> را وارد کنید:",
         reply_markup=sell_cancel_keyboard(),
         parse_mode="HTML",
     )
@@ -348,7 +397,7 @@ async def sell_receive_password(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["password"] = update.message.text.strip()
     await update.message.reply_text(
         "✅ رمز ثبت شد.\n\n"
-        "مرحله ۷/۸ — آیا می‌خواهید <b>ایمیل اکانت بعد از فروش تغییر کند؟</b>\n"
+        "مرحله ۸/۹ — آیا می‌خواهید <b>ایمیل اکانت بعد از فروش تغییر کند؟</b>\n"
         "(برای امنیت خریدار پیشنهاد می‌شود)",
         reply_markup=sell_email_change_keyboard(),
         parse_mode="HTML",
@@ -372,7 +421,7 @@ async def sell_email_change_no(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     context.user_data["new_email"] = None
     await query.edit_message_text(
-        "مرحله ۸/۸ — لطفاً <b>شماره تلفن</b> خود را وارد کنید:\n"
+        "مرحله ۹/۹ — لطفاً <b>شماره تلفن</b> خود را وارد کنید:\n"
         "(برای ارتباط با خریدار پس از تأیید فروش)",
         parse_mode="HTML",
     )
@@ -383,7 +432,7 @@ async def sell_receive_new_email(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["new_email"] = update.message.text.strip()
     await update.message.reply_text(
         "✅ ایمیل جدید ثبت شد.\n\n"
-        "مرحله ۸/۸ — لطفاً <b>شماره تلفن</b> خود را وارد کنید:\n"
+        "مرحله ۹/۹ — لطفاً <b>شماره تلفن</b> خود را وارد کنید:\n"
         "(برای ارتباط با خریدار پس از تأیید فروش)",
         reply_markup=sell_cancel_keyboard(),
         parse_mode="HTML",
@@ -399,6 +448,7 @@ async def sell_receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
         seller_id=user.id,
         title=context.user_data["title"],
         description=context.user_data["description"],
+        price=context.user_data.get("price", ""),
         email=context.user_data["email"],
         password=context.user_data["password"],
         new_email=context.user_data.get("new_email"),
@@ -410,11 +460,15 @@ async def sell_receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if context.user_data.get("video"):
         db.add_media(listing_id, "video", context.user_data["video"])
 
+    price_line = f"💰 قیمت: <b>{context.user_data.get('price', '—')}</b>\n\n" if context.user_data.get("price") else ""
+    bot_line = f"\n🤖 ربات: {_bot_link()}" if _bot_link() else ""
+
     channel_text = (
         f"🎮 <b>{context.user_data['title']}</b>\n\n"
         f"📝 {context.user_data['description']}\n\n"
+        f"{price_line}"
         f"🔑 کد یکتای آگهی: <code>{unique_code}</code>\n\n"
-        "برای خرید این اکانت، کد بالا را در ربات وارد کنید."
+        f"برای خرید این اکانت، کد بالا را در ربات وارد کنید.{bot_line}"
     )
 
     photos = context.user_data["photos"]
@@ -435,7 +489,8 @@ async def sell_receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             sent_msg = await context.bot.send_message(CHANNEL_ID, channel_text, parse_mode="HTML")
         channel_publish_ok = True
-    except Exception:
+    except Exception as e:
+        logger.error("خطا در انتشار کانال: %s", e)
         channel_publish_ok = False
 
     if sent_msg:
@@ -479,27 +534,29 @@ def sell_conversation() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📢 ثبت آگهی فروش$"), sell_start)],
         states={
-            SELL_TITLE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_title),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_DESCRIPTION:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_description),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_PHOTOS:        [MessageHandler(filters.PHOTO, sell_receive_photo),
-                                  CallbackQueryHandler(sell_end_photos_callback, pattern="^end_photos$"),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_VIDEO:         [MessageHandler(filters.VIDEO, sell_receive_video),
-                                  CallbackQueryHandler(sell_skip_video_callback, pattern="^skip_video$"),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_EMAIL:         [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_email),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_PASSWORD:      [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_password),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_EMAIL_CHANGE_Q:[CallbackQueryHandler(sell_email_change_yes, pattern="^email_yes$"),
-                                  CallbackQueryHandler(sell_email_change_no, pattern="^email_no$"),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_NEW_EMAIL:     [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_new_email),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
-            SELL_PHONE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_phone),
-                                  CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_TITLE:          [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_title),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_DESCRIPTION:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_description),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_PRICE:          [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_price),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_PHOTOS:         [MessageHandler(filters.PHOTO, sell_receive_photo),
+                                   CallbackQueryHandler(sell_end_photos_callback, pattern="^end_photos$"),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_VIDEO:          [MessageHandler(filters.VIDEO, sell_receive_video),
+                                   CallbackQueryHandler(sell_skip_video_callback, pattern="^skip_video$"),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_EMAIL:          [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_email),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_PASSWORD:       [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_password),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_EMAIL_CHANGE_Q: [CallbackQueryHandler(sell_email_change_yes, pattern="^email_yes$"),
+                                   CallbackQueryHandler(sell_email_change_no, pattern="^email_no$"),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_NEW_EMAIL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_new_email),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
+            SELL_PHONE:          [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_phone),
+                                   CallbackQueryHandler(sell_cancel, pattern="^cancel_sell$")],
         },
         fallbacks=[
             CommandHandler("cancel", sell_cancel),
@@ -572,8 +629,11 @@ async def buy_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["buy_listing_title"] = listing["title"]
     context.user_data["buy_transaction_id"] = transaction_id
 
+    price_line = f"💰 قیمت: <b>{listing['price']}</b>\n\n" if listing["price"] else ""
+
     await update.message.reply_text(
         f"✅ آگهی پیدا شد: <b>{listing['title']}</b>\n\n"
+        f"{price_line}"
         "💳 <b>اطلاعات پرداخت:</b>\n"
         f"شماره کارت: <code>{CARD_NUMBER}</code>\n"
         f"به نام: <b>{CARD_OWNER}</b>\n\n"
@@ -633,6 +693,10 @@ async def buy_receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def buy_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    # اگر تراکنشی در حال انجام بود، آگهی را آزاد کن
+    listing_id = context.user_data.get("buy_listing_id")
+    if listing_id:
+        db.unlock_listing(listing_id)
     context.user_data.clear()
     await update.message.reply_text(
         "❌ فرآیند خرید لغو شد.",
@@ -825,10 +889,12 @@ async def view_listing_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     status = STATUS_FA.get(listing["status"], listing["status"])
+    price_line = f"💰 قیمت: {listing['price']}\n" if listing.get("price") else ""
     await query.edit_message_text(
         f"📋 <b>جزئیات آگهی</b>\n\n"
         f"📌 عنوان: {listing['title']}\n"
         f"📝 توضیحات: {listing['description']}\n"
+        f"{price_line}"
         f"🔑 کد یکتا: <code>{listing['unique_code']}</code>\n"
         f"📊 وضعیت: {status}\n"
         f"📅 تاریخ ثبت: {listing['created_at'][:10]}\n",
@@ -879,7 +945,7 @@ async def my_listings_back_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 # ====================================================
-# هندلرهای پنل ادمین
+# هندلرهای پنل ادمین — مدیریت کاربران
 # ====================================================
 
 async def admin_panel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -955,6 +1021,183 @@ async def unban_receive_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 
+# ====================================================
+# هندلرهای پنل ادمین — مدیریت آگهی‌ها
+# ====================================================
+
+async def admin_listings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(
+        "📋 <b>مدیریت آگهی‌ها</b>\n\nفیلتر مورد نظر را انتخاب کنید:",
+        reply_markup=admin_listings_filter_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+async def admin_listings_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    data = query.data  # admin_listings_active | inactive | reserved | all | back
+    if data == "admin_listings_back":
+        await query.edit_message_text(
+            "⚙️ <b>پنل مدیریت</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    status_map = {
+        "admin_listings_active":   "active",
+        "admin_listings_reserved": "reserved",
+        "admin_listings_inactive": "inactive",
+        "admin_listings_all":      None,
+    }
+    status_filter = status_map.get(data)
+    listings = db.get_all_listings(status_filter)
+
+    label = {
+        "admin_listings_active":   "فعال",
+        "admin_listings_reserved": "در حال خرید",
+        "admin_listings_inactive": "غیرفعال",
+        "admin_listings_all":      "همه",
+    }.get(data, "")
+
+    if not listings:
+        await query.edit_message_text(
+            f"📋 هیچ آگهی‌ای با فیلتر «{label}» یافت نشد.",
+            reply_markup=admin_listings_filter_keyboard(),
+        )
+        return
+
+    await query.edit_message_text(
+        f"📋 <b>آگهی‌ها ({label}) — {len(listings)} مورد</b>\n"
+        f"{'(نمایش ۲۰ مورد اول)' if len(listings) > 20 else ''}\n"
+        "برای مشاهده جزئیات کلیک کنید:",
+        reply_markup=admin_listings_keyboard(listings),
+        parse_mode="HTML",
+    )
+
+
+async def admin_view_listing_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    listing_id = int(query.data.split("_")[-1])
+    listing = db.get_listing_by_id(listing_id)
+    if not listing:
+        await query.edit_message_text("❌ آگهی یافت نشد.")
+        return
+
+    status = STATUS_FA.get(listing["status"], listing["status"])
+    price_line = f"💰 قیمت: {listing['price']}\n" if listing.get("price") else ""
+    seller = db.get_user(listing["seller_id"])
+    seller_info = f"👤 فروشنده: {seller['full_name']}" if seller else f"👤 فروشنده: <code>{listing['seller_id']}</code>"
+    if seller and seller.get("username"):
+        seller_info += f" (@{seller['username']})"
+    seller_info += f"\n🆔 آیدی فروشنده: <code>{listing['seller_id']}</code>"
+
+    await query.edit_message_text(
+        f"📋 <b>جزئیات آگهی (ادمین)</b>\n\n"
+        f"🆔 شناسه: <code>{listing['id']}</code>\n"
+        f"📌 عنوان: {listing['title']}\n"
+        f"📝 توضیحات: {listing['description']}\n"
+        f"{price_line}"
+        f"🔑 کد یکتا: <code>{listing['unique_code']}</code>\n"
+        f"📊 وضعیت: {status}\n"
+        f"{seller_info}\n"
+        f"📅 تاریخ ثبت: {listing['created_at'][:10]}\n",
+        reply_markup=admin_listing_actions_keyboard(listing_id, listing["status"]),
+        parse_mode="HTML",
+    )
+
+
+async def admin_deactivate_listing_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    listing_id = int(query.data.split("_")[-1])
+    listing = db.get_listing_by_id(listing_id)
+    if not listing:
+        await query.edit_message_text("❌ آگهی یافت نشد.")
+        return
+    if listing["status"] not in ("active", "reserved"):
+        await query.answer("این آگهی قبلاً غیرفعال شده است.", show_alert=True)
+        return
+
+    db.deactivate_listing(listing_id)
+    if listing["channel_msg_id"]:
+        try:
+            await context.bot.delete_message(CHANNEL_ID, listing["channel_msg_id"])
+        except Exception:
+            pass
+
+    # اطلاع به فروشنده
+    try:
+        await context.bot.send_message(
+            listing["seller_id"],
+            f"⚠️ آگهی شما «{listing['title']}» توسط ادمین غیرفعال شد.\n"
+            "در صورت نیاز با ادمین تماس بگیرید.",
+        )
+    except Exception:
+        pass
+
+    await query.edit_message_text(
+        f"✅ آگهی «{listing['title']}» (کد: {listing['unique_code']}) غیرفعال شد."
+    )
+
+
+async def admin_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "🔍 <b>جستجوی آگهی</b>\n\nکد یکتای آگهی (۶ کاراکتر) را وارد کنید:",
+        parse_mode="HTML",
+    )
+    return ADMIN_WAIT_SEARCH_CODE
+
+
+async def admin_search_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    code = update.message.text.strip().upper()
+    listing = db.get_listing_by_code(code)
+    if not listing:
+        await update.message.reply_text(
+            f"❌ آگهی‌ای با کد «{code}» یافت نشد.",
+            reply_markup=admin_panel_keyboard(),
+        )
+        return ConversationHandler.END
+
+    status = STATUS_FA.get(listing["status"], listing["status"])
+    price_line = f"💰 قیمت: {listing['price']}\n" if listing.get("price") else ""
+    seller = db.get_user(listing["seller_id"])
+    seller_info = f"👤 فروشنده: {seller['full_name']}" if seller else f"👤 آیدی فروشنده: <code>{listing['seller_id']}</code>"
+    if seller and seller.get("username"):
+        seller_info += f" (@{seller['username']})"
+
+    await update.message.reply_text(
+        f"📋 <b>نتیجه جستجو</b>\n\n"
+        f"🆔 شناسه: <code>{listing['id']}</code>\n"
+        f"📌 عنوان: {listing['title']}\n"
+        f"📝 توضیحات: {listing['description']}\n"
+        f"{price_line}"
+        f"🔑 کد یکتا: <code>{listing['unique_code']}</code>\n"
+        f"📊 وضعیت: {status}\n"
+        f"{seller_info}\n"
+        f"📅 تاریخ ثبت: {listing['created_at'][:10]}",
+        reply_markup=admin_listing_actions_keyboard(listing["id"], listing["status"]),
+        parse_mode="HTML",
+    )
+    return ConversationHandler.END
+
+
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await send_main_menu(update, context)
     return ConversationHandler.END
@@ -962,9 +1205,13 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 def admin_conversation() -> ConversationHandler:
     return ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^✅ رفع مسدودیت کاربر$"), unban_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^✅ رفع مسدودیت کاربر$"), unban_start),
+            MessageHandler(filters.Regex("^🔍 جستجوی آگهی$"), admin_search_start),
+        ],
         states={
-            ADMIN_WAIT_UNBAN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, unban_receive_id)],
+            ADMIN_WAIT_UNBAN_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, unban_receive_id)],
+            ADMIN_WAIT_SEARCH_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_receive_code)],
         },
         fallbacks=[MessageHandler(filters.Regex("^🔙 بازگشت به منوی اصلی$"), back_to_main)],
         allow_reentry=True,
@@ -1001,7 +1248,6 @@ async def check_seller_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
             reason=f"عدم تأیید تحویل اکانت در مهلت {SELLER_CONFIRM_TIMEOUT_HOURS} ساعته (تراکنش {tx['id']})",
         )
         db.deactivate_listing(listing["id"])
-        db.unlock_listing(listing["id"])
         db.timeout_transaction(tx["id"])
 
         try:
@@ -1037,9 +1283,19 @@ async def check_seller_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
 # راه‌اندازی اصلی
 # ====================================================
 
-async def main() -> None:
+def main() -> None:
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     db.init_db()
     logger.info("دیتابیس راه‌اندازی شد.")
+
+    # اجرای health-check server در thread مجزا (برای UptimeRobot / Render)
+    health_thread = threading.Thread(target=_start_health_server, daemon=True)
+    health_thread.start()
 
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1056,16 +1312,22 @@ async def main() -> None:
     # هندلرهای منو
     app.add_handler(MessageHandler(filters.Regex("^⚙️ پنل مدیریت$"),          admin_panel_handler))
     app.add_handler(MessageHandler(filters.Regex("^🚫 لیست کاربران مسدود$"),  list_banned_handler))
+    app.add_handler(MessageHandler(filters.Regex("^📋 مدیریت آگهی‌ها$"),      admin_listings_handler))
     app.add_handler(MessageHandler(filters.Regex("^🔙 بازگشت به منوی اصلی$"), back_to_main))
     app.add_handler(MessageHandler(filters.Regex("^📋 آگهی‌های من$"),          my_listings_handler))
 
     # Callback های تأیید/رد
-    app.add_handler(CallbackQueryHandler(admin_approve_callback,    pattern=r"^admin_approve_\d+$"))
-    app.add_handler(CallbackQueryHandler(admin_reject_callback,     pattern=r"^admin_reject_\d+$"))
-    app.add_handler(CallbackQueryHandler(seller_confirm_callback,   pattern=r"^seller_confirm_\d+$"))
-    app.add_handler(CallbackQueryHandler(view_listing_callback,     pattern=r"^view_listing_\d+$"))
-    app.add_handler(CallbackQueryHandler(delete_listing_callback,   pattern=r"^delete_listing_\d+$"))
-    app.add_handler(CallbackQueryHandler(my_listings_back_callback, pattern="^my_listings_back$"))
+    app.add_handler(CallbackQueryHandler(admin_approve_callback,           pattern=r"^admin_approve_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_reject_callback,            pattern=r"^admin_reject_\d+$"))
+    app.add_handler(CallbackQueryHandler(seller_confirm_callback,          pattern=r"^seller_confirm_\d+$"))
+    app.add_handler(CallbackQueryHandler(view_listing_callback,            pattern=r"^view_listing_\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_listing_callback,          pattern=r"^delete_listing_\d+$"))
+    app.add_handler(CallbackQueryHandler(my_listings_back_callback,        pattern="^my_listings_back$"))
+
+    # Callback های ادمین — مدیریت آگهی‌ها
+    app.add_handler(CallbackQueryHandler(admin_listings_filter_callback,   pattern=r"^admin_listings_"))
+    app.add_handler(CallbackQueryHandler(admin_view_listing_callback,      pattern=r"^admin_view_listing_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_deactivate_listing_callback, pattern=r"^admin_deactivate_\d+$"))
 
     # وظیفه دوره‌ای timeout
     app.job_queue.run_repeating(
@@ -1075,16 +1337,8 @@ async def main() -> None:
     )
 
     logger.info("ربات شروع به کار کرد (Polling)...")
-
-    # ✅ سازگار با Python 3.12 تا 3.14
-    async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        await asyncio.Event().wait()   # تا SIGTERM/SIGINT از Render منتظر بماند
-        await app.updater.stop()
-        await app.stop()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())   # ← event loop قبل از همه چیز ساخته می‌شه
+    main()
