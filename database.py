@@ -65,12 +65,17 @@ def init_db() -> None:
             );
         """)
 
-    # مهاجرت: اضافه‌کردن ستون price به جدول موجود (اگر وجود نداشت)
+    # مهاجرت: اضافه‌کردن ستون‌های جدید به جداول موجود
+    migrations = [
+        "ALTER TABLE listings ADD COLUMN price TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE transactions ADD COLUMN buyer_confirmed_at TEXT",
+    ]
     with get_connection() as conn:
-        try:
-            conn.execute("ALTER TABLE listings ADD COLUMN price TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass  # ستون از قبل وجود دارد
+        for sql in migrations:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # ستون از قبل وجود دارد
 
 
 # ===========================
@@ -319,15 +324,45 @@ def admin_reject_transaction(transaction_id: int) -> None:
 
 
 def seller_confirm_transaction(transaction_id: int) -> None:
+    """وضعیت را به pending_buyer تغییر می‌دهد تا خریدار تأیید کند."""
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE transactions
-            SET status = 'completed', seller_confirmed_at = datetime('now')
+            SET status = 'pending_buyer', seller_confirmed_at = datetime('now')
             WHERE id = ?
             """,
             (transaction_id,),
         )
+
+
+def buyer_confirm_transaction(transaction_id: int) -> None:
+    """تأیید دریافت توسط خریدار — تراکنش را تکمیل‌شده می‌کند."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE transactions
+            SET status = 'completed', buyer_confirmed_at = datetime('now')
+            WHERE id = ?
+            """,
+            (transaction_id,),
+        )
+
+
+def mark_listing_sold(listing_id: int) -> None:
+    """آگهی را به وضعیت فروخته‌شده تغییر می‌دهد."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE listings SET status = 'sold' WHERE id = ?", (listing_id,)
+        )
+
+
+def get_pending_buyer_transactions() -> list:
+    """برمی‌گرداند تراکنش‌هایی که منتظر تأیید خریدار هستند."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM transactions WHERE status = 'pending_buyer' AND seller_confirmed_at IS NOT NULL"
+        ).fetchall()
 
 
 def get_transaction(transaction_id: int) -> sqlite3.Row | None:

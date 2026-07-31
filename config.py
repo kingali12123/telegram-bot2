@@ -10,8 +10,8 @@ BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 # آیدی کانال (مثلاً @mychannel یا -1001234567890)
 CHANNEL_ID: str = os.environ["CHANNEL_ID"]
 
-# لینک دعوت به کانال (برای دکمه عضویت)
-CHANNEL_LINK: str = os.environ["CHANNEL_LINK"]
+# لینک دعوت به کانال (برای دکمه عضویت) — اختیاری
+CHANNEL_LINK: str = os.environ.get("CHANNEL_LINK", "")
 
 # آیدی‌های عددی ادمین‌ها، جداشده با ویرگول
 ADMIN_IDS: list[int] = [
@@ -22,8 +22,9 @@ ADMIN_IDS: list[int] = [
 BOT_USERNAME: str = os.environ.get("BOT_USERNAME", "")
 
 # اطلاعات کارت بانکی
-CARD_NUMBER: str = os.environ["CARD_NUMBER"]
-CARD_OWNER: str = os.environ["CARD_OWNER"]
+# پشتیبانی از هر دو نام متغیر محیطی (CARD_NUMBER و PAYMENT_CARD_NUMBER)
+CARD_NUMBER: str = os.environ.get("CARD_NUMBER") or os.environ.get("PAYMENT_CARD_NUMBER", "")
+CARD_OWNER: str = os.environ.get("CARD_OWNER", "")
 
 # مسیر فایل دیتابیس
 DATABASE_PATH: str = os.environ.get("DATABASE_PATH", "bot_data.db")
@@ -34,5 +35,13 @@ TIMEOUT_CHECK_INTERVAL_MINUTES: int = int(os.environ.get("TIMEOUT_CHECK_INTERVAL
 # مدت زمان تأیید فروشنده (ساعت)
 SELLER_CONFIRM_TIMEOUT_HOURS: int = int(os.environ.get("SELLER_CONFIRM_TIMEOUT_HOURS", "72"))
 
+# مدت زمان تأیید خریدار (ساعت) — بعد از این مدت سفارش خودکار تکمیل می‌شود
+BUYER_CONFIRM_TIMEOUT_HOURS: int = int(os.environ.get("BUYER_CONFIRM_TIMEOUT_HOURS", "72"))
+
 # پورت health-check برای UptimeRobot / Render (پیش‌فرض: 8080)
 HEALTH_PORT: int = int(os.environ.get("PORT", "8080"))
+
+# آدرس عمومی سرویس روی Render (خودکار توسط Render تنظیم می‌شود)
+# مثال: https://my-bot.onrender.com
+# ربات از این آدرس برای self-ping استفاده می‌کند تا سرویس بیدار بماند
+RENDER_EXTERNAL_URL: str = os.environ.get("RENDER_EXTERNAL_URL", "")

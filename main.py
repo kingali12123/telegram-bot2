@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """ربات واسطه خرید و فروش اکانت بازی — نقطه ورود اصلی"""
 import logging
+import socket
 import threading
+import time
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -23,11 +26,13 @@ from config import (
     ADMIN_IDS,
     BOT_TOKEN,
     BOT_USERNAME,
+    BUYER_CONFIRM_TIMEOUT_HOURS,
     CARD_NUMBER,
     CARD_OWNER,
     CHANNEL_ID,
     CHANNEL_LINK,
     HEALTH_PORT,
+    RENDER_EXTERNAL_URL,
     SELLER_CONFIRM_TIMEOUT_HOURS,
     TIMEOUT_CHECK_INTERVAL_MINUTES,
 )
@@ -37,6 +42,7 @@ from keyboards import (
     admin_listings_keyboard,
     admin_panel_keyboard,
     admin_receipt_keyboard,
+    buyer_confirm_keyboard,
     channel_join_keyboard,
     listing_actions_keyboard,
     main_menu_keyboard,
@@ -92,20 +98,39 @@ STATUS_FA = {
 # ====================================================
 
 class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802
+    def _send_ok(self) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"OK")
+
+    def do_GET(self) -> None:   # noqa: N802
+        self._send_ok()
+
+    def do_HEAD(self) -> None:  # noqa: N802  — برخی monitorها HEAD می‌زنند
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
 
     def log_message(self, *args) -> None:  # نویز لاگ را سرکوب کن
         pass
 
 
 def _start_health_server() -> None:
-    server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
-    logger.info("Health-check server started on port %d", HEALTH_PORT)
-    server.serve_forever()
+    """
+    Health-check HTTP server.
+    در یک حلقه اجرا می‌شود تا در صورت crash خودکار restart شود.
+    """
+    while True:
+        try:
+            server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
+            # جلوگیری از خطای "Address already in use" هنگام restart
+            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            logger.info("Health-check server started on port %d", HEALTH_PORT)
+            server.serve_forever()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Health-check server crashed (%s) — restarting in 5s…", exc)
+            time.sleep(5)
 
 
 # ====================================================
@@ -825,11 +850,12 @@ async def seller_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("این تراکنش قبلاً پردازش شده است.", show_alert=True)
         return
 
-    db.seller_confirm_transaction(transaction_id)
+    db.seller_confirm_transaction(transaction_id)  # → status: pending_buyer
     db.deactivate_listing(listing["id"])
 
+    # اطلاعات اکانت به خریدار ارسال می‌شه + دکمه تأیید دریافت
     buyer_text = (
-        f"🎉 <b>خرید شما تأیید شد!</b>\n\n"
+        f"🎉 <b>فروشنده اکانت را تحویل داد!</b>\n\n"
         f"🎮 <b>{listing['title']}</b>\n\n"
         f"📧 ایمیل: <code>{listing['email']}</code>\n"
         f"🔑 رمز عبور: <code>{listing['password']}</code>\n"
@@ -837,18 +863,125 @@ async def seller_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     if listing["new_email"]:
         buyer_text += f"📨 ایمیل جدید (بعد از تحویل): <code>{listing['new_email']}</code>\n"
     seller_id = listing["seller_id"]
-    buyer_text += f"\n📞 تماس مستقیم با فروشنده:\n<a href='tg://user?id={seller_id}'>کلیک کنید</a>"
+    buyer_text += (
+        f"\n📞 تماس مستقیم با فروشنده:\n<a href='tg://user?id={seller_id}'>کلیک کنید</a>\n\n"
+        f"⏳ لطفاً اکانت را بررسی کنید و سپس یکی از دکمه‌های زیر را بزنید:"
+    )
 
     try:
-        await context.bot.send_message(tx["buyer_id"], buyer_text, parse_mode="HTML")
+        await context.bot.send_message(
+            tx["buyer_id"],
+            buyer_text,
+            parse_mode="HTML",
+            reply_markup=buyer_confirm_keyboard(transaction_id),
+        )
     except Exception:
         pass
 
     buyer_id = tx["buyer_id"]
     await query.edit_message_text(
         "✅ <b>تحویل اکانت تأیید شد!</b>\n\n"
-        "تراکنش با موفقیت کامل شد.\n"
+        "اطلاعات به خریدار ارسال شد و منتظر تأیید دریافت از ایشان هستیم.\n"
         f"📞 تماس مستقیم با خریدار:\n<a href='tg://user?id={buyer_id}'>کلیک کنید</a>",
+        parse_mode="HTML",
+    )
+
+
+# ====================================================
+# Callback های تأیید/اعتراض خریدار
+# ====================================================
+
+async def buyer_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """خریدار دریافت اکانت را تأیید می‌کند → تراکنش تکمیل می‌شود."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+
+    transaction_id = int(query.data.split("_")[-1])
+    tx = db.get_transaction(transaction_id)
+    if not tx:
+        await query.edit_message_text("❌ تراکنش یافت نشد.")
+        return
+    if tx["buyer_id"] != user.id:
+        await query.answer("⛔ این تراکنش متعلق به شما نیست!", show_alert=True)
+        return
+    if tx["status"] != "pending_buyer":
+        await query.answer("این تراکنش قبلاً پردازش شده است.", show_alert=True)
+        return
+
+    listing = db.get_listing_by_id(tx["listing_id"])
+    db.buyer_confirm_transaction(transaction_id)
+    db.mark_listing_sold(tx["listing_id"])
+
+    # حذف آگهی از کانال
+    if listing and listing["channel_msg_id"]:
+        try:
+            await context.bot.delete_message(CHANNEL_ID, listing["channel_msg_id"])
+        except Exception:
+            pass
+
+    # اطلاع به فروشنده
+    if listing:
+        try:
+            await context.bot.send_message(
+                listing["seller_id"],
+                f"🎉 <b>خریدار دریافت اکانت را تأیید کرد!</b>\n\n"
+                f"🎮 آگهی: <b>{listing['title']}</b>\n"
+                "معامله با موفقیت به پایان رسید. ✅",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await query.edit_message_text(
+        "✅ <b>دریافت اکانت تأیید شد!</b>\n\n"
+        "معامله با موفقیت تکمیل شد. ممنون از خرید شما! 🎉",
+        parse_mode="HTML",
+    )
+
+
+async def buyer_dispute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """خریدار مشکل گزارش می‌دهد → به ادمین ارجاع داده می‌شود."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+
+    transaction_id = int(query.data.split("_")[-1])
+    tx = db.get_transaction(transaction_id)
+    if not tx:
+        await query.edit_message_text("❌ تراکنش یافت نشد.")
+        return
+    if tx["buyer_id"] != user.id:
+        await query.answer("⛔ این تراکنش متعلق به شما نیست!", show_alert=True)
+        return
+    if tx["status"] != "pending_buyer":
+        await query.answer("این تراکنش قبلاً پردازش شده است.", show_alert=True)
+        return
+
+    listing = db.get_listing_by_id(tx["listing_id"])
+
+    # اطلاع به همه ادمین‌ها
+    title = listing["title"] if listing else "نامشخص"
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"⚠️ <b>اعتراض خریدار</b>\n\n"
+                f"🛒 آگهی: <b>{title}</b>\n"
+                f"👤 خریدار: {user.full_name}"
+                + (f" (@{user.username})" if user.username else "")
+                + f"\n🆔 آیدی خریدار: <code>{user.id}</code>\n"
+                f"🔢 شناسه تراکنش: <code>{transaction_id}</code>\n\n"
+                "خریدار مشکل گزارش کرده است. لطفاً بررسی و میانجی‌گری کنید.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await query.edit_message_text(
+        "⚠️ <b>اعتراض شما ثبت شد.</b>\n\n"
+        "موضوع برای بررسی به ادمین ارجاع داده شد.\n"
+        "به زودی با شما تماس گرفته می‌شود. ⏳",
         parse_mode="HTML",
     )
 
@@ -1279,6 +1412,87 @@ async def check_seller_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Seller %s timed out — tx %s banned and deactivated.", listing["seller_id"], tx["id"])
 
 
+async def check_buyer_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    تراکنش‌هایی که خریدار در مهلت مقرر تأیید دریافت نکرده را به‌صورت
+    خودکار تکمیل‌شده در نظر می‌گیرد.
+    """
+    pending = db.get_pending_buyer_transactions()
+    now = datetime.now(tz=timezone.utc)
+
+    for tx in pending:
+        confirmed_at_str = tx["seller_confirmed_at"]
+        if not confirmed_at_str:
+            continue
+        try:
+            confirmed_at = datetime.fromisoformat(confirmed_at_str).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        if now - confirmed_at < timedelta(hours=BUYER_CONFIRM_TIMEOUT_HOURS):
+            continue
+
+        listing = db.get_listing_by_id(tx["listing_id"])
+        db.buyer_confirm_transaction(tx["id"])
+        db.mark_listing_sold(tx["listing_id"])
+
+        # حذف آگهی از کانال
+        if listing and listing["channel_msg_id"]:
+            try:
+                await context.bot.delete_message(CHANNEL_ID, listing["channel_msg_id"])
+            except Exception:
+                pass
+
+        # اطلاع به خریدار
+        try:
+            await context.bot.send_message(
+                tx["buyer_id"],
+                f"ℹ️ <b>تراکنش به‌صورت خودکار تکمیل شد.</b>\n\n"
+                f"چون در مهلت {BUYER_CONFIRM_TIMEOUT_HOURS} ساعته تأیید یا اعتراضی ثبت نشد، "
+                "سفارش تکمیل‌شده در نظر گرفته شد.\n"
+                "در صورت هرگونه مشکل با ادمین تماس بگیرید.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+        # اطلاع به فروشنده
+        if listing:
+            try:
+                await context.bot.send_message(
+                    listing["seller_id"],
+                    f"✅ <b>سفارش به‌صورت خودکار تکمیل شد.</b>\n\n"
+                    f"آگهی: <b>{listing['title']}</b>\n"
+                    f"خریدار در مهلت {BUYER_CONFIRM_TIMEOUT_HOURS} ساعته پاسخی نداد — معامله تکمیل‌شده محاسبه می‌شود.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+        logger.info("Buyer timeout auto-complete — tx %s completed.", tx["id"])
+
+
+# ====================================================
+# Self-ping job — سرویس Render رو بیدار نگه می‌داره
+# ====================================================
+
+async def self_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    هر ۱۰ دقیقه یه‌بار به URL عمومی سرویس Render درخواست می‌زند.
+    این کار باعث می‌شود حتی اگر UptimeRobot ping نزند، سرویس خاموش نشود.
+    """
+    if not RENDER_EXTERNAL_URL:
+        return
+    url = RENDER_EXTERNAL_URL.rstrip("/") + "/"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("User-Agent", "TelegramBot-SelfPing/1.0")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            logger.debug("Self-ping → %s  status=%d", url, resp.status)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Self-ping failed: %s", exc)
+
+
 # ====================================================
 # راه‌اندازی اصلی
 # ====================================================
@@ -1320,6 +1534,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(admin_approve_callback,           pattern=r"^admin_approve_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_reject_callback,            pattern=r"^admin_reject_\d+$"))
     app.add_handler(CallbackQueryHandler(seller_confirm_callback,          pattern=r"^seller_confirm_\d+$"))
+    app.add_handler(CallbackQueryHandler(buyer_confirm_callback,           pattern=r"^buyer_confirm_\d+$"))
+    app.add_handler(CallbackQueryHandler(buyer_dispute_callback,           pattern=r"^buyer_dispute_\d+$"))
     app.add_handler(CallbackQueryHandler(view_listing_callback,            pattern=r"^view_listing_\d+$"))
     app.add_handler(CallbackQueryHandler(delete_listing_callback,          pattern=r"^delete_listing_\d+$"))
     app.add_handler(CallbackQueryHandler(my_listings_back_callback,        pattern="^my_listings_back$"))
@@ -1329,12 +1545,33 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(admin_view_listing_callback,      pattern=r"^admin_view_listing_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_deactivate_listing_callback, pattern=r"^admin_deactivate_\d+$"))
 
-    # وظیفه دوره‌ای timeout
+    # وظیفه دوره‌ای timeout فروشنده
     app.job_queue.run_repeating(
         check_seller_timeouts,
         interval=TIMEOUT_CHECK_INTERVAL_MINUTES * 60,
         first=60,
     )
+
+    # وظیفه دوره‌ای timeout خریدار
+    app.job_queue.run_repeating(
+        check_buyer_timeouts,
+        interval=TIMEOUT_CHECK_INTERVAL_MINUTES * 60,
+        first=120,
+    )
+
+    # Self-ping: ربات هر ۱۰ دقیقه خودش رو ping می‌زند تا سرویس Render بیدار بماند
+    if RENDER_EXTERNAL_URL:
+        app.job_queue.run_repeating(
+            self_ping_job,
+            interval=10 * 60,   # هر ۱۰ دقیقه
+            first=30,           # ۳۰ ثانیه بعد از راه‌اندازی شروع کن
+        )
+        logger.info("Self-ping job registered → %s (every 10 min)", RENDER_EXTERNAL_URL)
+    else:
+        logger.info(
+            "RENDER_EXTERNAL_URL تنظیم نشده — self-ping غیرفعال است. "
+            "برای فعال‌سازی، متغیر محیطی را در Render تنظیم کنید."
+        )
 
     logger.info("ربات شروع به کار کرد (Polling)...")
     app.run_polling(drop_pending_updates=True)

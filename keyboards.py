@@ -71,6 +71,13 @@ def seller_confirm_keyboard(transaction_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def buyer_confirm_keyboard(transaction_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ اکانت رو دریافت کردم", callback_data=f"buyer_confirm_{transaction_id}")],
+        [InlineKeyboardButton("⚠️ مشکل دارم", callback_data=f"buyer_dispute_{transaction_id}")],
+    ])
+
+
 def my_listings_keyboard(listings: list) -> InlineKeyboardMarkup:
     rows = []
     for lst in listings:
