@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 # شماره مراحل مکالمه
 # ====================================================
 
-# فروش (0-14)
+# فروش (0-15)
 (
     SELL_CATEGORY,
     SELL_TITLE,
@@ -91,20 +91,21 @@ logger = logging.getLogger(__name__)
     SELL_CLAN_LEVEL,
     SELL_CLAN_MEMBERS,
     SELL_CLAN_TROPHIES,
-) = range(15)
+    SELL_CARD_NUMBER,       # مرحله جدید: شماره کارت فروشنده
+) = range(16)
 
-# خرید (15-17)
-BUY_ENTER_CODE      = 15
-BUY_PAYMENT_METHOD  = 16
-BUY_SEND_RECEIPT    = 17
+# خرید (16-18)
+BUY_ENTER_CODE      = 16
+BUY_PAYMENT_METHOD  = 17
+BUY_SEND_RECEIPT    = 18
 
-# کیف پول (18-19)
-WALLET_ENTER_AMOUNT = 18
-WALLET_SEND_RECEIPT = 19
+# کیف پول (19-20)
+WALLET_ENTER_AMOUNT = 19
+WALLET_SEND_RECEIPT = 20
 
-# ادمین (20-21)
-ADMIN_WAIT_UNBAN_ID    = 20
-ADMIN_WAIT_SEARCH_CODE = 21
+# ادمین (21-22)
+ADMIN_WAIT_UNBAN_ID    = 21
+ADMIN_WAIT_SEARCH_CODE = 22
 
 # وضعیت فارسی آگهی
 STATUS_FA = {
@@ -219,6 +220,14 @@ async def _notify_admins(bot: Bot, text: str, **kwargs) -> None:
             pass
 
 
+def _safe_card(listing) -> str:
+    """شماره کارت فروشنده را از آگهی می‌خواند؛ اگر ثبت نشده بود، جایگزین می‌دهد."""
+    try:
+        return listing["seller_card_number"] or "ثبت نشده"
+    except (IndexError, KeyError):
+        return "ثبت نشده"
+
+
 async def _publish_listing_to_channel(bot: Bot, listing_id: int) -> bool:
     """پابلیش آگهی در کانال پس از تأیید ادمین. برمی‌گرداند True اگه موفق بود."""
     listing = db.get_listing_by_id(listing_id)
@@ -250,6 +259,7 @@ async def _publish_listing_to_channel(bot: Bot, listing_id: int) -> bool:
         if listing["clan_trophies"]:parts.append(f"🏆 تراف: {listing['clan_trophies']}")
         clan_info = "\n".join(parts) + "\n\n" if parts else ""
 
+    # توجه: شماره کارت فروشنده در متن عمومی کانال گنجانده نمی‌شود
     text = (
         f"🎮 [{cat_label}] <b>{listing['title']}</b>\n\n"
         f"📝 {listing['description']}\n\n"
@@ -786,30 +796,62 @@ async def sell_clan_trophies(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return SELL_PHONE
 
 
-# --- ثبت نهایی ---
+# --- دریافت شماره تلفن → پرسش شماره کارت ---
 
 async def sell_receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    phone = update.message.text.strip()
-    user  = update.effective_user
-    ud    = context.user_data
-    cat   = ud.get("category", "coc_account")
+    context.user_data["phone"] = update.message.text.strip()
+    await update.message.reply_text(
+        "✅ شماره تلفن ثبت شد.\n\n"
+        "مرحله بعدی — <b>شماره کارت بانکی</b> خود را وارد کنید:\n"
+        "این شماره پس از فروش موفق برای واریز سهم شما استفاده می‌شود و "
+        "فقط برای ادمین قابل مشاهده است.\n\n"
+        "فرمت: ۱۶ رقم (با یا بدون خط‌تیره)\n"
+        "مثال: <code>6037991234567890</code> یا <code>6037-9912-3456-7890</code>",
+        reply_markup=sell_cancel_keyboard(),
+        parse_mode="HTML",
+    )
+    return SELL_CARD_NUMBER
+
+
+# --- دریافت شماره کارت → ثبت نهایی آگهی ---
+
+async def sell_receive_card_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip().replace("-", "").replace(" ", "")
+
+    # اعتبارسنجی: باید دقیقاً ۱۶ رقم عددی باشد
+    if not raw.isdigit() or len(raw) != 16:
+        await update.message.reply_text(
+            "⚠️ شماره کارت نامعتبر است.\n"
+            "باید دقیقاً <b>۱۶ رقم عددی</b> باشد (خط‌تیره مجاز است).\n\n"
+            "مثال: <code>6037991234567890</code> یا <code>6037-9912-3456-7890</code>",
+            reply_markup=sell_cancel_keyboard(),
+            parse_mode="HTML",
+        )
+        return SELL_CARD_NUMBER
+
+    card_number = raw
+    user = update.effective_user
+    ud   = context.user_data
+    cat  = ud.get("category", "coc_account")
     price_toman = ud.get("price_toman")
+    phone = ud.get("phone", "")
 
     listing_id, unique_code = db.create_listing(
-        seller_id    = user.id,
-        category     = cat,
-        title        = ud["title"],
-        description  = ud["description"],
-        price        = _fmt(price_toman) if price_toman else "",
-        price_toman  = price_toman,
-        email        = ud.get("email", ""),
-        password     = ud.get("password", ""),
-        new_email    = ud.get("new_email"),
-        phone        = phone,
-        clan_name    = ud.get("clan_name"),
-        clan_level   = ud.get("clan_level"),
-        member_count = ud.get("member_count"),
-        clan_trophies= ud.get("clan_trophies"),
+        seller_id          = user.id,
+        category           = cat,
+        title              = ud["title"],
+        description        = ud["description"],
+        price              = _fmt(price_toman) if price_toman else "",
+        price_toman        = price_toman,
+        email              = ud.get("email", ""),
+        password           = ud.get("password", ""),
+        new_email          = ud.get("new_email"),
+        phone              = phone,
+        clan_name          = ud.get("clan_name"),
+        clan_level         = ud.get("clan_level"),
+        member_count       = ud.get("member_count"),
+        clan_trophies      = ud.get("clan_trophies"),
+        seller_card_number = card_number,
     )
 
     for fid in ud["photos"]:
@@ -832,7 +874,8 @@ async def sell_receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"👤 فروشنده: {user.full_name}"
         + (f" (@{user.username})" if user.username else "")
         + f"\n🆔 آیدی فروشنده: <code>{user.id}</code>\n"
-        f"🔑 کد آگهی: <code>{unique_code}</code>"
+        f"🔑 کد آگهی: <code>{unique_code}</code>\n"
+        f"💳 شماره کارت فروشنده جهت واریز: <code>{card_number}</code>"
     )
     photos = ud["photos"]
     for admin_id in ADMIN_IDS:
@@ -902,6 +945,7 @@ def sell_conversation() -> ConversationHandler:
                                  cancel_cb],
             SELL_NEW_EMAIL:    [text_h(sell_receive_new_email),    cancel_cb],
             SELL_PHONE:        [text_h(sell_receive_phone),        cancel_cb],
+            SELL_CARD_NUMBER:  [text_h(sell_receive_card_number),  cancel_cb],
             SELL_CLAN_NAME:    [text_h(sell_clan_name),            cancel_cb],
             SELL_CLAN_LEVEL:   [text_h(sell_clan_level),           cancel_cb],
             SELL_CLAN_MEMBERS: [text_h(sell_clan_members),         cancel_cb],
@@ -1164,6 +1208,10 @@ async def buy_receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     db.set_receipt(tx_id, photo_file_id)
 
+    # دریافت شماره کارت فروشنده برای نمایش به ادمین
+    listing = db.get_listing_by_id(listing_id)
+    card_number = _safe_card(listing) if listing else "ثبت نشده"
+
     admin_text = (
         f"🧾 <b>رسید پرداخت جدید</b>\n\n"
         f"🛒 آگهی: <b>{listing_title}</b>\n"
@@ -1171,7 +1219,8 @@ async def buy_receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"👤 خریدار: {user.full_name}"
         + (f" (@{user.username})" if user.username else "")
         + f"\n🆔 آیدی: <code>{user.id}</code>\n"
-        f"🔢 شناسه تراکنش: <code>{tx_id}</code>"
+        f"🔢 شناسه تراکنش: <code>{tx_id}</code>\n"
+        f"💳 شماره کارت فروشنده جهت واریز: <code>{card_number}</code>"
     )
     for admin_id in ADMIN_IDS:
         try:
@@ -1477,6 +1526,21 @@ async def buyer_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
+    # یادآوری به ادمین: واریز سهم فروشنده
+    if listing:
+        card_number   = _safe_card(listing)
+        seller_amount = tx["seller_amount"]
+        await _notify_admins(
+            context.bot,
+            f"✅ <b>معامله تکمیل شد — واریز به فروشنده الزامی است</b>\n\n"
+            f"🎮 آگهی: <b>{listing['title']}</b>\n"
+            f"🆔 کد: <code>{listing['unique_code']}</code>\n"
+            f"💵 مبلغ قابل واریز به فروشنده: <b>{_fmt(seller_amount)}</b>\n"
+            f"💳 شماره کارت فروشنده جهت واریز: <code>{card_number}</code>\n\n"
+            "لطفاً مبلغ فوق را به شماره کارت بالا واریز کنید.",
+            parse_mode="HTML",
+        )
+
     await query.edit_message_text(
         "✅ <b>دریافت اکانت تأیید شد!</b>\n\nمعامله با موفقیت تکمیل شد. ممنون از خرید شما! 🎉",
         parse_mode="HTML",
@@ -1738,6 +1802,7 @@ async def admin_view_listing_callback(update: Update, context: ContextTypes.DEFA
         f"💵 سهم فروشنده: {_fmt(seller_gets)}\n"
         f"💹 سود ربات: {_fmt(bot_profit)}\n"
     ) if buyer_pays else ""
+    card_line = f"💳 شماره کارت فروشنده: <code>{_safe_card(listing)}</code>\n"
 
     text = (
         f"📋 <b>جزئیات آگهی</b>\n\n"
@@ -1747,7 +1812,8 @@ async def admin_view_listing_callback(update: Update, context: ContextTypes.DEFA
         f"{price_line}{commission_line}"
         f"🔑 کد: <code>{listing['unique_code']}</code>\n"
         f"📊 وضعیت: {status}\n"
-        f"👤 فروشنده: <code>{listing['seller_id']}</code>"
+        f"👤 فروشنده: <code>{listing['seller_id']}</code>\n"
+        f"{card_line}"
     )
     await query.edit_message_text(
         text, parse_mode="HTML",
@@ -1900,6 +1966,22 @@ async def check_buyer_timeouts(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except Exception:
                 pass
+
+        # یادآوری به ادمین: واریز سهم فروشنده (تکمیل خودکار)
+        if listing:
+            card_number   = _safe_card(listing)
+            seller_amount = tx["seller_amount"]
+            await _notify_admins(
+                context.bot,
+                f"✅ <b>معامله به‌صورت خودکار تکمیل شد — واریز به فروشنده الزامی است</b>\n\n"
+                f"🎮 آگهی: <b>{listing['title']}</b>\n"
+                f"🆔 کد: <code>{listing['unique_code']}</code>\n"
+                f"💵 مبلغ قابل واریز به فروشنده: <b>{_fmt(seller_amount)}</b>\n"
+                f"💳 شماره کارت فروشنده جهت واریز: <code>{card_number}</code>\n\n"
+                "لطفاً مبلغ فوق را به شماره کارت بالا واریز کنید.",
+                parse_mode="HTML",
+            )
+
         logger.info("Buyer timeout auto-complete — tx %s.", tx["id"])
 
 

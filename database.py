@@ -81,25 +81,26 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS listings (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                unique_code     TEXT UNIQUE NOT NULL,
-                seller_id       INTEGER NOT NULL,
-                category        TEXT NOT NULL DEFAULT 'coc_account',
-                title           TEXT NOT NULL,
-                description     TEXT NOT NULL,
-                price           TEXT NOT NULL DEFAULT '',
-                price_toman     INTEGER,
-                email           TEXT NOT NULL DEFAULT '',
-                password        TEXT NOT NULL DEFAULT '',
-                new_email       TEXT,
-                phone           TEXT NOT NULL DEFAULT '',
-                clan_name       TEXT,
-                clan_level      TEXT,
-                member_count    TEXT,
-                clan_trophies   TEXT,
-                channel_msg_id  INTEGER,
-                status          TEXT NOT NULL DEFAULT 'draft',
-                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                unique_code        TEXT UNIQUE NOT NULL,
+                seller_id          INTEGER NOT NULL,
+                category           TEXT NOT NULL DEFAULT 'coc_account',
+                title              TEXT NOT NULL,
+                description        TEXT NOT NULL,
+                price              TEXT NOT NULL DEFAULT '',
+                price_toman        INTEGER,
+                email              TEXT NOT NULL DEFAULT '',
+                password           TEXT NOT NULL DEFAULT '',
+                new_email          TEXT,
+                phone              TEXT NOT NULL DEFAULT '',
+                clan_name          TEXT,
+                clan_level         TEXT,
+                member_count       TEXT,
+                clan_trophies      TEXT,
+                seller_card_number TEXT,
+                channel_msg_id     INTEGER,
+                status             TEXT NOT NULL DEFAULT 'draft',
+                created_at         TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (seller_id) REFERENCES users(user_id)
             );
 
@@ -156,6 +157,8 @@ def _run_migrations() -> None:
         "ALTER TABLE listings ADD COLUMN clan_level    TEXT",
         "ALTER TABLE listings ADD COLUMN member_count  TEXT",
         "ALTER TABLE listings ADD COLUMN clan_trophies TEXT",
+        # شماره کارت فروشنده
+        "ALTER TABLE listings ADD COLUMN seller_card_number TEXT",
         # transactions
         "ALTER TABLE transactions ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'card'",
         "ALTER TABLE transactions ADD COLUMN buyer_amount   INTEGER",
@@ -395,6 +398,7 @@ def create_listing(
     clan_level: str | None = None,
     member_count: str | None = None,
     clan_trophies: str | None = None,
+    seller_card_number: str = "",
 ) -> tuple[int, str]:
     code = generate_unique_code()
     with get_connection() as conn:
@@ -403,12 +407,14 @@ def create_listing(
             INSERT INTO listings
                 (unique_code, seller_id, category, title, description,
                  price, price_toman, email, password, new_email, phone,
-                 clan_name, clan_level, member_count, clan_trophies, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')
+                 clan_name, clan_level, member_count, clan_trophies,
+                 seller_card_number, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft')
             """,
             (code, seller_id, category, title, description,
              price, price_toman, email, password, new_email, phone,
-             clan_name, clan_level, member_count, clan_trophies),
+             clan_name, clan_level, member_count, clan_trophies,
+             seller_card_number),
         )
         return cur.lastrowid, code
 
